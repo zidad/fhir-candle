@@ -93,4 +93,79 @@ public class FromIssueTestsR4
         entry.Response.ShouldNotBeNull();
         entry.Response.Status.ShouldBe("201 Created");
     }
+
+    /// <summary>
+    /// Tests that a transaction-response Bundle does not emit empty "location" or
+    /// "etag" strings on the response entry — empty primitives violate FHIR R4 and
+    /// strict clients (Firely .NET SDK) refuse to parse them.
+    /// For issue: https://github.com/FHIR/fhir-candle/issues/51
+    /// </summary>
+    [Fact]
+    public void TransactionResponseOmitsEmptyLocationAndEtag()
+    {
+        TenantConfiguration config = new()
+        {
+            FhirVersion = FhirReleases.FhirSequenceCodes.R4,
+            ControllerName = "r4",
+            BaseUrl = "http://localhost/fhir/r4",
+            LoadDirectory = null,
+            AllowExistingId = true,
+            AllowCreateAsUpdate = true,
+        };
+
+        IFhirStore store = new VersionedFhirStore();
+        store.Init(config);
+
+        // A read-only search inside a transaction produces a response entry that has
+        // no location to report and no resource version to etag — both fields used to
+        // serialize as empty strings before the fix.
+        string json = """
+            {
+              "resourceType": "Bundle",
+              "type": "transaction",
+              "entry": [
+                {
+                  "request": {
+                    "method": "GET",
+                    "url": "Patient?identifier=foo|bar"
+                  }
+                }
+              ]
+            }
+            """;
+
+        FhirRequestContext ctx = new()
+        {
+            TenantName = store.Config.ControllerName,
+            Store = store,
+            HttpMethod = "POST",
+            Url = store.Config.BaseUrl,
+            Forwarded = null,
+            Authorization = null,
+            SourceContent = json,
+            SourceFormat = "application/fhir+json",
+            DestinationFormat = "application/fhir+json",
+        };
+
+        bool success = store.ProcessBundle(ctx, out FhirResponseContext response);
+
+        success.ShouldBeTrue();
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        response.SerializedResource.ShouldNotBeNullOrEmpty();
+
+        // The serialized JSON must not contain "location": "" or "etag": "" —
+        // when there is no value, the element must be omitted entirely.
+        response.SerializedResource.ShouldNotContain("\"location\":\"\"");
+        response.SerializedResource.ShouldNotContain("\"etag\":\"\"");
+
+        MinimalBundle? bundle = JsonSerializer.Deserialize<MinimalBundle>(response.SerializedResource);
+        bundle.ShouldNotBeNull();
+        bundle.Entries.ShouldNotBeNullOrEmpty();
+
+        MinimalBundle.MinimalEntry.MinimalResponse? entryResponse = bundle.Entries.First().Response;
+        entryResponse.ShouldNotBeNull();
+        // After the fix, both should be omitted (null) rather than empty strings.
+        entryResponse.Location.ShouldBeNull();
+        entryResponse.ETag.ShouldBeNull();
+    }
 }
