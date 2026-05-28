@@ -95,14 +95,24 @@ public class FromIssueTestsR4
     }
 
     /// <summary>
-    /// Tests that the FHIR R4 standard search parameter `CarePlan.patient`
-    /// (defined as `CarePlan.subject.where(resolve() is Patient)`) returns
-    /// CarePlans whose subject is a Patient reference. fhir-candle currently
-    /// matches on `subject=` but returns zero results for `patient=` on the
-    /// same data.
+    /// Documents the (correct) behaviour of the FHIR R4 `CarePlan.patient`
+    /// search parameter, defined as `CarePlan.subject.where(resolve() is Patient)`.
+    ///
+    /// candle evaluates the spec-defined FHIRPath expression literally:
+    /// `resolve()` actually fetches the referenced resource. When the target
+    /// Patient is in the store, `patient=` matches; when the reference is
+    /// dangling, it doesn't. `subject=` matches on the reference URL alone
+    /// and never calls `resolve()`.
+    ///
+    /// This is stricter than some FHIR servers (notably Microsoft's open-source
+    /// SQL-backed FHIR Server / Azure Health Data Services) that index
+    /// reference search parameters by the resource-type prefix in the URL and
+    /// skip `resolve()`. Consumers used to that looser behaviour can see
+    /// surprising zero-result searches when their reference targets aren't
+    /// stored alongside the referrer.
     /// </summary>
     [Fact]
-    public void CarePlanPatientSearchParameterShouldResolveSubject()
+    public void CarePlanPatientSearchResolvesReferencedPatient()
     {
         TenantConfiguration config = new()
         {
@@ -117,67 +127,61 @@ public class FromIssueTestsR4
         IFhirStore store = new VersionedFhirStore();
         store.Init(config);
 
-        string carePlanJson = """
-            {
-              "resourceType": "CarePlan",
-              "id": "cp-1",
-              "status": "active",
-              "intent": "plan",
-              "subject": { "reference": "Patient/test-patient-123" }
-            }
-            """;
-
-        FhirRequestContext createCtx = new()
+        FhirRequestContext PutResource(string resourceType, string body) => new()
         {
             TenantName = store.Config.ControllerName,
             Store = store,
             HttpMethod = "PUT",
-            Url = store.Config.BaseUrl + "/CarePlan",
+            Url = store.Config.BaseUrl + "/" + resourceType,
             Forwarded = null,
             Authorization = null,
-            SourceContent = carePlanJson,
+            SourceContent = body,
             SourceFormat = "application/fhir+json",
             DestinationFormat = "application/fhir+json",
-            ResourceType = "CarePlan",
+            ResourceType = resourceType,
         };
-        store.InstanceUpdate(createCtx, out _).ShouldBeTrue();
 
-        // Sanity check — the `subject=` form works.
-        FhirRequestContext subjectSearch = new()
+        FhirRequestContext Search(string resourceType, string urlQuery) => new()
         {
             TenantName = store.Config.ControllerName,
             Store = store,
             HttpMethod = "GET",
-            Url = store.Config.BaseUrl + "/CarePlan",
+            Url = store.Config.BaseUrl + "/" + resourceType,
             Forwarded = null,
             Authorization = null,
-            UrlQuery = "subject=Patient/test-patient-123",
+            UrlQuery = urlQuery,
             SourceFormat = "application/fhir+json",
             DestinationFormat = "application/fhir+json",
-            ResourceType = "CarePlan",
+            ResourceType = resourceType,
         };
-        store.TypeSearch(subjectSearch, out FhirResponseContext subjectResp).ShouldBeTrue();
+
+        // Seed a CarePlan with a dangling Patient reference.
+        store.InstanceUpdate(
+            PutResource("CarePlan",
+                """{"resourceType":"CarePlan","id":"cp-1","status":"active","intent":"plan","subject":{"reference":"Patient/test-patient-123"}}"""),
+            out _).ShouldBeTrue();
+
+        // subject= matches on the reference value directly — works regardless
+        // of whether the target Patient exists.
+        store.TypeSearch(Search("CarePlan", "subject=Patient/test-patient-123"), out FhirResponseContext subjectResp).ShouldBeTrue();
         JsonSerializer.Deserialize<MinimalBundle>(subjectResp.SerializedResource)!.Total.ShouldBe(1);
 
-        // The R4-defined `patient=` search parameter should resolve to the same
-        // CarePlan (https://www.hl7.org/fhir/R4/careplan.html#search). Currently
-        // candle returns total = 0.
-        FhirRequestContext patientSearch = new()
-        {
-            TenantName = store.Config.ControllerName,
-            Store = store,
-            HttpMethod = "GET",
-            Url = store.Config.BaseUrl + "/CarePlan",
-            Forwarded = null,
-            Authorization = null,
-            UrlQuery = "patient=Patient/test-patient-123",
-            SourceFormat = "application/fhir+json",
-            DestinationFormat = "application/fhir+json",
-            ResourceType = "CarePlan",
-        };
-        store.TypeSearch(patientSearch, out FhirResponseContext patientResp).ShouldBeTrue();
-        JsonSerializer.Deserialize<MinimalBundle>(patientResp.SerializedResource)!.Total.ShouldBe(
+        // patient= invokes resolve(); with no Patient in the store, resolve()
+        // returns nothing and the FHIRPath predicate excludes this CarePlan.
+        store.TypeSearch(Search("CarePlan", "patient=Patient/test-patient-123"), out FhirResponseContext beforeResp).ShouldBeTrue();
+        JsonSerializer.Deserialize<MinimalBundle>(beforeResp.SerializedResource)!.Total.ShouldBe(
+            0,
+            "with a dangling reference, resolve() returns nothing and the patient= predicate misses");
+
+        // Seed the referenced Patient; resolve() now succeeds.
+        store.InstanceUpdate(
+            PutResource("Patient",
+                """{"resourceType":"Patient","id":"test-patient-123"}"""),
+            out _).ShouldBeTrue();
+
+        store.TypeSearch(Search("CarePlan", "patient=Patient/test-patient-123"), out FhirResponseContext afterResp).ShouldBeTrue();
+        JsonSerializer.Deserialize<MinimalBundle>(afterResp.SerializedResource)!.Total.ShouldBe(
             1,
-            "FHIR R4 defines CarePlan?patient as CarePlan.subject.where(resolve() is Patient); the seeded CarePlan has a Patient subject");
+            "with the target Patient present, resolve() returns it, `is Patient` holds, and the CarePlan matches");
     }
 }
